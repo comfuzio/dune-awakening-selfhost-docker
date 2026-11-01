@@ -3,6 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+. runtime/scripts/compose-project.sh
+DUNE_COMPOSE_PROJECT_NAME="$(dune_resolve_compose_project_name "$(pwd -P)")"
+export DUNE_COMPOSE_PROJECT_NAME
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$DUNE_COMPOSE_PROJECT_NAME}"
+
 config_value() {
   local file="$1"
   local key="$2"
@@ -56,8 +61,10 @@ first_known_value() {
 steam_build_id() {
   local app_id="$1"
   local manifest="/tmp/dune-appmanifest-${app_id}.acf"
+  local orchestrator_container=""
 
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx dune-orchestrator; then
+  orchestrator_container="$(dune_compose_running_service_container "$DUNE_COMPOSE_PROJECT_NAME" orchestrator 2>/dev/null || true)"
+  if [ -n "$orchestrator_container" ]; then
     docker compose exec -T orchestrator sh -lc "cat /srv/dune/server/steamapps/appmanifest_${app_id}.acf 2>/dev/null" > "$manifest" 2>/dev/null || true
     if [ -s "$manifest" ]; then
       awk '/"buildid"/ { gsub(/"/, "", $2); print $2; exit }' "$manifest"
@@ -76,8 +83,10 @@ PROJECT_VERSION="dev"
 GIT_BRANCH="unknown"
 GIT_COMMIT="unknown"
 GIT_STATE="unknown"
+GIT_METADATA_AVAILABLE=0
 
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_METADATA_AVAILABLE=1
   GIT_BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
   [ -n "$GIT_BRANCH" ] || GIT_BRANCH="detached"
   GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -104,6 +113,7 @@ SERVER_REGION_VALUE="$(first_known_value \
   "$(container_env_value dune-server-gateway OnlineSubsystem_DatacenterId 2>/dev/null || true)" \
   || echo "unknown")"
 SERVER_IP_VALUE="$(first_known_value \
+  "$(resolve_server_ip 2>/dev/null || true)" \
   "$(config_value .env SERVER_IP 2>/dev/null || true)" \
   "$(container_env_value dune-director HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
   "$(container_env_value dune-server-gateway HOST_DATACENTER_IP_ADDRESS 2>/dev/null || true)" \
@@ -125,9 +135,14 @@ fi
 
 echo "=== Self-Host Stack Version ==="
 printf "%-18s %s\n" "Project version:" "$PROJECT_VERSION"
-printf "%-18s %s\n" "Git branch:" "$GIT_BRANCH"
-printf "%-18s %s\n" "Git commit:" "$GIT_COMMIT"
-printf "%-18s %s\n" "Working tree:" "$GIT_STATE"
+if [ "$GIT_METADATA_AVAILABLE" = "1" ]; then
+  printf "%-18s %s\n" "Install source:" "Git checkout"
+  printf "%-18s %s\n" "Git branch:" "$GIT_BRANCH"
+  printf "%-18s %s\n" "Git commit:" "$GIT_COMMIT"
+  printf "%-18s %s\n" "Working tree:" "$GIT_STATE"
+else
+  printf "%-18s %s\n" "Install source:" "release archive / non-git install"
+fi
 
 echo
 echo "=== Server config ==="

@@ -3,8 +3,34 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+if [ "${DUNE_RUNTIME_PERMISSIONS_REPAIRED:-0}" != "1" ]; then
+  runtime/scripts/repair-host-runtime-permissions.sh
+  export DUNE_RUNTIME_PERMISSIONS_REPAIRED=1
+fi
+
+[ -f .env ] && . ./.env
+source runtime/scripts/host-paths.sh
+
 CONTAINER_NAME="dune-autoscaler"
 IMAGE="dune-orchestrator:dev"
+REPO_UID="$(stat -c '%u' .)"
+REPO_GID="$(stat -c '%g' .)"
+HOST_UID="${DUNE_HOST_UID:-$REPO_UID}"
+HOST_GID="${DUNE_HOST_GID:-$REPO_GID}"
+DOCKER_SOCK_GID="${DOCKER_SOCKET_GID:-}"
+AUTOSCALER_CONTAINER_REPO_ROOT="/repo"
+HOST_REPO_ROOT="$(host_path "$PWD")"
+
+if [ "$HOST_UID" = "0" ] && [ "$REPO_UID" != "0" ]; then
+  HOST_UID="$REPO_UID"
+fi
+if [ "$HOST_GID" = "0" ] && [ "$REPO_GID" != "0" ]; then
+  HOST_GID="$REPO_GID"
+fi
+
+if [ -z "$DOCKER_SOCK_GID" ] && [ -S /var/run/docker.sock ]; then
+  DOCKER_SOCK_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
+fi
 
 mkdir -p runtime/generated runtime/logs
 
@@ -34,15 +60,37 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# autoscaler.sh reads its configuration from the environment and never sources
+# .env itself, so anything an operator sets there has to be handed over here.
+# The scan intervals were silently inert before this; POSTGRES_PORT and
+# DUNE_PSQL_TRANSPORT decide which port the in-container psql client dials and
+# whether it dials one at all. An unset value is passed through as empty, which
+# every consumer treats as "use the default".
 echo "Starting autoscaler container..."
+group_args=()
+if [ -n "$DOCKER_SOCK_GID" ]; then
+  group_args+=(--group-add "$DOCKER_SOCK_GID")
+fi
+
 docker run -d \
+  "${DUNE_DOCKER_LOG_ARGS[@]}" \
   --name "$CONTAINER_NAME" \
   --network host \
   --restart unless-stopped \
+  --user "${HOST_UID}:${HOST_GID}" \
+  "${group_args[@]}" \
   --entrypoint bash \
+  -e "DUNE_CONTAINER_REPO_ROOT=$AUTOSCALER_CONTAINER_REPO_ROOT" \
+  -e "DUNE_HOST_REPO_ROOT=$HOST_REPO_ROOT" \
+  -e "DUNE_AUTOSCALER_INTERVAL=${DUNE_AUTOSCALER_INTERVAL:-}" \
+  -e "DUNE_AUTOSCALER_DEMAND_INTERVAL=${DUNE_AUTOSCALER_DEMAND_INTERVAL:-}" \
+  -e "DUNE_AUTOSCALER_CHAT_EXCHANGE_REPAIR_SECONDS=${DUNE_AUTOSCALER_CHAT_EXCHANGE_REPAIR_SECONDS:-}" \
+  -e "DUNE_AUTOSCALER_CHAT_EXCHANGE_REPAIR_TIMEOUT_SECONDS=${DUNE_AUTOSCALER_CHAT_EXCHANGE_REPAIR_TIMEOUT_SECONDS:-}" \
+  -e "POSTGRES_PORT=${POSTGRES_PORT:-}" \
+  -e "DUNE_PSQL_TRANSPORT=${DUNE_PSQL_TRANSPORT:-}" \
   -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$PWD:$PWD" \
-  -w "$PWD" \
+  -v "$HOST_REPO_ROOT:$AUTOSCALER_CONTAINER_REPO_ROOT" \
+  -w "$AUTOSCALER_CONTAINER_REPO_ROOT" \
   "$IMAGE" \
   runtime/scripts/autoscaler.sh >/dev/null
 

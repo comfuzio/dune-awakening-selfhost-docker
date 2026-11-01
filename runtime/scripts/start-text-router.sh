@@ -4,13 +4,16 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/host-paths.sh
 source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
+source runtime/scripts/fake-k8s-serviceaccount.sh
 WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-text-router:${WORLD_IMAGE_TAG}"
+TEXT_ROUTER_PORT="$(resolve_text_router_port)"
 
 TOKEN_FILE="runtime/secrets/funcom-token.txt"
 RMQ_SECRET_FILE="runtime/secrets/rmq-http-token-auth-secret.txt"
@@ -31,58 +34,40 @@ RMQ_HTTP_TOKEN_AUTH_SECRET="$(tr -d '\r\n' < "$RMQ_SECRET_FILE")"
 SERVER_TITLE="$(resolve_server_title)"
 SERVER_REGION="$(resolve_server_region)"
 SERVER_IP="$(resolve_server_ip)"
+HOST_DATACENTER_ID_VALUE="$(resolve_host_datacenter_id)"
 BATTLEGROUP_ID="$(resolve_battlegroup_id)"
-if [ -n "${DUNE_FAKE_K8S_SERVICEACCOUNT_DIR:-}" ]; then
-  FAKE_K8S_SERVICEACCOUNT_DIR="$DUNE_FAKE_K8S_SERVICEACCOUNT_DIR"
-else
-  FAKE_K8S_SERVICEACCOUNT_DIR="$PWD/runtime/generated/dune-fake-k8s-serviceaccount-text-router-$$"
-fi
+DUNE_DB_PASSWORD="${DUNE_DB_PASSWORD:-dune}"
+FAKE_K8S_SERVICEACCOUNT_DIR="$(fake_k8s_serviceaccount_dir text-router)"
 
 
-mkdir -p "$FAKE_K8S_SERVICEACCOUNT_DIR"
-
-cat > "$FAKE_K8S_SERVICEACCOUNT_DIR/namespace" <<'EOF'
-funcom-seabass-dune-docker
-EOF
-
-cat > "$FAKE_K8S_SERVICEACCOUNT_DIR/token" <<'EOF'
-fake-token
-EOF
-
-# Intentionally keep this empty for now.
-# With this Funcom build, an invalid Kubernetes CA causes IGWO init to fail non-fatally,
-# while a valid CA makes the app try to call igwo.local:6443 and crash unless we provide a compatibility API.
-: > "$FAKE_K8S_SERVICEACCOUNT_DIR/ca.crt"
-
-chmod -R 755 "$FAKE_K8S_SERVICEACCOUNT_DIR"
+prepare_fake_k8s_serviceaccount "$FAKE_K8S_SERVICEACCOUNT_DIR" funcom-seabass-dune-docker
 
 docker network create dune-net 2>/dev/null || true
 docker rm -f dune-text-router 2>/dev/null || true
 
 echo "Waiting for game RabbitMQ TLS listener..."
+rmq_tls_ready=0
 for i in $(seq 1 60); do
-  if docker exec dune-rmq-game rabbitmq-diagnostics -q listeners 2>/dev/null | grep -q "5672.*amqp/ssl"; then
+  if timeout 5 docker exec dune-rmq-game rabbitmq-diagnostics -q listeners 2>/dev/null | grep -q "5672.*amqp/ssl"; then
     echo "Game RabbitMQ TLS listener is ready."
+    rmq_tls_ready=1
     break
   fi
   sleep 2
 done
 
-echo "Waiting for game RabbitMQ AMQPS login path..."
-for i in $(seq 1 60); do
-  if timeout 3 bash -lc 'cat < /dev/null > /dev/tcp/127.0.0.1/31982' 2>/dev/null; then
-    echo "Host port 31982 is reachable."
-    break
-  fi
-  sleep 2
-done
+if [ "$rmq_tls_ready" != "1" ]; then
+  echo "Game RabbitMQ TLS listener was not confirmed before TextRouter start."
+  echo "Continuing anyway; TextRouter will retry RabbitMQ while starting."
+fi
 
 docker run -d \
+  "${DUNE_DOCKER_LOG_ARGS[@]}" \
   --name dune-text-router \
   --network dune-net \
   --restart unless-stopped \
-  -p 127.0.0.1:5059:5059/tcp \
-  -v "$FAKE_K8S_SERVICEACCOUNT_DIR:/run/secrets/kubernetes.io/serviceaccount:ro" \
+  -p "127.0.0.1:${TEXT_ROUTER_PORT}:5059/tcp" \
+  -v "$(host_path "$FAKE_K8S_SERVICEACCOUNT_DIR"):/run/secrets/kubernetes.io/serviceaccount:ro" \
   -e "KUBERNETES_SERVICE_HOST=igwo.local" \
   -e "KUBERNETES_SERVICE_PORT=6443" \
   -e "KUBERNETES_SERVICE_PORT_HTTPS=6443" \
@@ -93,19 +78,21 @@ docker run -d \
   -e "FuncomLiveServices__RmqTlsEnabled=true" \
   -e "RMQ_HTTP_TOKEN_AUTH_SECRET=$RMQ_HTTP_TOKEN_AUTH_SECRET" \
   -e "BATTLEGROUP_LANGUAGE=en-US" \
-  -e "HOST_DATACENTER_ID=${SERVER_PROVIDER:-dune-docker}" \
+  -e "HOST_DATACENTER_ID=$HOST_DATACENTER_ID_VALUE" \
   -e "HOST_DATACENTER_IP_ADDRESS=$SERVER_IP" \
   -e "ASPNETCORE_URLS=http://0.0.0.0:5059" \
   -e "DOTNET_HOSTBUILDER__RELOADCONFIGONCHANGE=false" \
   -e "Database_address=dune-postgres:5432" \
   -e "Database_name=dune" \
   -e "Database_user=dune" \
-  -e "Database_password=dune" \
+  -e "Database_password=$DUNE_DB_PASSWORD" \
   "$IMAGE" \
   --RMQAdminHostname=dune-rmq-admin \
   --RMQAdminPort=5672 \
   --RMQGameHostname=dune-rmq-game \
   --RMQGamePort=5672
+
+prune_legacy_fake_k8s_serviceaccounts
 
 sleep 8
 

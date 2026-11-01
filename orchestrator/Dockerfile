@@ -1,4 +1,5 @@
 FROM ubuntu:24.04
+LABEL io.github.red-blink.dune-selfhost.component="orchestrator"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -14,6 +15,7 @@ RUN dpkg --add-architecture i386 \
     git \
     python3 \
     python3-yaml \
+    postgresql-client \
     procps \
     util-linux \
     lib32gcc-s1 \
@@ -28,10 +30,15 @@ RUN useradd -m -s /bin/bash dune \
     /srv/dune/steam \
     /srv/dune/generated \
     /srv/dune/cache \
- && chown -R dune:dune /home/dune /srv/dune
+    /work \
+ && chown -R dune:dune /home/dune /srv/dune /work \
+ && usermod -aG docker dune
 
 COPY dune_orchestrator.py /usr/local/bin/dune
 RUN chmod +x /usr/local/bin/dune
 
-ENTRYPOINT ["/usr/local/bin/dune"]
-CMD ["help"]
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["dune", "daemon"]

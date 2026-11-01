@@ -4,16 +4,40 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 [ -f .env ] && . ./.env
-[ -f runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
+[ -r runtime/generated/battlegroup.env ] && . runtime/generated/battlegroup.env
 
-[ -f runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+[ -r runtime/generated/image-tags.env ] && . runtime/generated/image-tags.env
+source runtime/scripts/host-paths.sh
+source runtime/scripts/runtime-env.sh
 source runtime/scripts/image-tags.sh
+source runtime/scripts/generated-file-paths.sh
 WORLD_IMAGE_TAG="$(resolve_world_image_tag)"
 IMAGE="registry.funcom.com/funcom/self-hosting/seabass-server-rabbitmq:${WORLD_IMAGE_TAG}"
+RMQ_ADMIN_PORT="$(resolve_rmq_admin_port)"
+RMQ_ADMIN_HTTP_PORT="$(resolve_rmq_admin_http_port)"
+RMQ_GAME_PORT="$(resolve_rmq_game_port)"
+RMQ_GAME_HTTP_PORT="$(resolve_rmq_game_http_port)"
+# Host-side loopback mirror of the game RabbitMQ management endpoint. The
+# container-side management port remains 15672. Keeping the host port
+# configurable lets multi-VM deployments maintain a globally unique host-port
+# namespace while preserving the stock single-server default.
+RMQ_GAME_LOCAL_HTTP_PORT="$(resolve_rmq_game_local_http_port)"
 
 mkdir -p runtime/rabbitmq-admin/config
 mkdir -p runtime/rabbitmq-game/config
 mkdir -p runtime/rabbitmq-game/certs
+
+for generated_file in \
+  runtime/rabbitmq-admin/config/rabbitmq.conf \
+  runtime/rabbitmq-admin/config/enabled_plugins \
+  runtime/rabbitmq-game/config/rabbitmq.conf \
+  runtime/rabbitmq-game/config/enabled_plugins \
+  runtime/rabbitmq-game/certs/key.pem \
+  runtime/rabbitmq-game/certs/cert.pem \
+  runtime/rabbitmq-game/certs/cacert.pem
+do
+  repair_generated_file_path "$generated_file"
+done
 
 cat > runtime/rabbitmq-admin/config/rabbitmq.conf <<'EOF'
 listeners.tcp.default = 5672
@@ -83,31 +107,64 @@ chmod 644 runtime/rabbitmq-admin/config/enabled_plugins
 docker network create dune-net 2>/dev/null || true
 docker rm -f dune-rmq-admin dune-rmq-game 2>/dev/null || true
 
+# The management API is published on loopback, exactly as it already is for
+# dune-rmq-game below. lib/rabbitmq.sh publishes and polls the hot paths through
+# it, which is what keeps those calls from having to be a container exec each.
+# Until this container is recreated with the mapping the seam simply falls back,
+# so the change is safe to roll out before the next start-rabbitmq.sh run.
 docker run -d \
+  "${DUNE_DOCKER_LOG_ARGS[@]}" \
   --name dune-rmq-admin \
   --network dune-net \
   --restart unless-stopped \
-  -p 127.0.0.1:32573:5672 \
-  -v "$PWD/runtime/rabbitmq-admin/config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
-  -v "$PWD/runtime/rabbitmq-admin/config/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro" \
+  --health-cmd "rabbitmq-diagnostics -q ping" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 3 \
+  -p "127.0.0.1:${RMQ_ADMIN_PORT}:5672" \
+  -p "127.0.0.1:${RMQ_ADMIN_HTTP_PORT}:15672/tcp" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-admin/config/rabbitmq.conf"):/etc/rabbitmq/rabbitmq.conf:ro" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-admin/config/enabled_plugins"):/etc/rabbitmq/enabled_plugins:ro" \
   "$IMAGE"
-
 docker run -d \
+  "${DUNE_DOCKER_LOG_ARGS[@]}" \
   --name dune-rmq-game \
   --network dune-net \
   --restart unless-stopped \
-  -p 31982:5672/tcp \
-  -p 31983:15672/tcp \
-  -v "$PWD/runtime/rabbitmq-game/config/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro" \
-  -v "$PWD/runtime/rabbitmq-game/config/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro" \
-  -v "$PWD/runtime/rabbitmq-game/certs/cacert.pem:/etc/rabbitmq/cacert.pem:ro" \
-  -v "$PWD/runtime/rabbitmq-game/certs/cert.pem:/etc/rabbitmq/cert.pem:ro" \
-  -v "$PWD/runtime/rabbitmq-game/certs/key.pem:/etc/rabbitmq/key.pem:ro" \
+  --health-cmd "rabbitmq-diagnostics -q ping" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 3 \
+  -p "${RMQ_GAME_PORT}:5672/tcp" \
+  -p "127.0.0.1:${RMQ_GAME_LOCAL_HTTP_PORT}:15672/tcp" \
+  -p "${RMQ_GAME_HTTP_PORT}:15672/tcp" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-game/config/rabbitmq.conf"):/etc/rabbitmq/rabbitmq.conf:ro" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-game/config/enabled_plugins"):/etc/rabbitmq/enabled_plugins:ro" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-game/certs/cacert.pem"):/etc/rabbitmq/cacert.pem:ro" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-game/certs/cert.pem"):/etc/rabbitmq/cert.pem:ro" \
+  -v "$(host_path "$PWD/runtime/rabbitmq-game/certs/key.pem"):/etc/rabbitmq/key.pem:ro" \
   "$IMAGE"
 
 sleep 8
 
-docker exec dune-rmq-admin rabbitmq-diagnostics -q ping
-docker exec dune-rmq-game rabbitmq-diagnostics -q ping
+wait_for_rabbitmq() {
+  local container="$1"
+  local attempt
+
+  echo "Waiting for $container..."
+  for attempt in $(seq 1 36); do
+    if timeout 10 docker exec "$container" rabbitmq-diagnostics -q ping; then
+      return 0
+    fi
+    sleep 5
+  done
+
+  echo "$container did not become ready in time."
+  docker logs --tail 120 "$container" 2>&1 || true
+  return 1
+}
+
+wait_for_rabbitmq dune-rmq-admin
+wait_for_rabbitmq dune-rmq-game
 
 docker ps --filter "name=dune-rmq" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
