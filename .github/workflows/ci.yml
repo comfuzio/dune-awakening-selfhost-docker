@@ -126,6 +126,8 @@ jobs:
         run: |
           bash tests/tls-front-script-test.sh
           python3 runtime/scripts/test_tls_front_config.py
+      - name: Test the Realtime Data agent script
+        run: bash tests/realtime-agent-script-test.sh
       - name: Test stable farm readiness gating
         run: bash tests/farm-readiness-test.sh
       - name: Test current-start readiness and login queue safety
@@ -214,6 +216,8 @@ jobs:
           tests/autoscaler-dedicated-occupancy-test.sh
           tests/autoscaler-env-forwarding-test.sh
           python3 tests/test_autoscaler_log_cache.py
+          python3 tests/test_director_browser_recovery.py
+          python3 tests/test_game_farm_recovery_history.py
           python3 tests/test_chat_binding_batch.py
           python3 tests/test_game_container_security.py
           tests/psql-transport-test.sh
@@ -221,6 +225,7 @@ jobs:
           tests/postgres-shutdown-test.sh
           tests/postgres-bootstrap-test.sh
           tests/coriolis-coordinator-test.sh
+          bash tests/console-restart-isolation-test.sh
           tests/db-backup-validation-test.sh
           tests/battlegroup-identity-test.sh
           tests/db-system-backup-test.sh
@@ -310,6 +315,8 @@ jobs:
         run: bash tests/console-i18n-image-test.sh dune-console:ci
       - name: Build the encrypted front door image (go vet and its tests run in the build)
         run: docker build -t dune-tls-front:ci runtime/tls-front
+      - name: Build the public connectivity probe (its tests run in the build)
+        run: docker build -t dune-public-probe:ci runtime/public-probe
       - name: Check the runtime it actually ships
         run: |
           set -euo pipefail

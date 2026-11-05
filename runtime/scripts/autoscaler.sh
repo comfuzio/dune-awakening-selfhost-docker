@@ -9,6 +9,9 @@ source runtime/scripts/lib/igw-socket-health.sh
 # shellcheck source=runtime/scripts/lib/postgres.sh
 source runtime/scripts/lib/postgres.sh
 
+# shellcheck source=runtime/scripts/farm-readiness.sh
+source runtime/scripts/farm-readiness.sh
+
 INTERVAL="${DUNE_AUTOSCALER_INTERVAL:-5}"
 if ! [[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid DUNE_AUTOSCALER_INTERVAL; using 5 seconds." >&2
@@ -40,7 +43,7 @@ SIETCH_TOPOLOGY_MAINTENANCE_FILE="${DUNE_SIETCH_TOPOLOGY_MAINTENANCE_FILE:-runti
 SIETCH_TOPOLOGY_HEAL_GRACE_SECONDS="${DUNE_SIETCH_TOPOLOGY_HEAL_GRACE_SECONDS:-600}"
 DIRECTOR_HEAL_STALE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_STALE_SECONDS:-15}"
 DIRECTOR_HEAL_COOLDOWN_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_COOLDOWN_SECONDS:-300}"
-DIRECTOR_HEAL_REPUBLISH_GRACE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_REPUBLISH_GRACE_SECONDS:-45}"
+DIRECTOR_HEAL_REPUBLISH_GRACE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_HEAL_REPUBLISH_GRACE_SECONDS:-120}"
 DIRECTOR_CORE_READY_GRACE_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_CORE_READY_GRACE_SECONDS:-120}"
 DYNAMIC_READY_HEAL_STALE_SECONDS="${DUNE_AUTOSCALER_DYNAMIC_READY_HEAL_STALE_SECONDS:-20}"
 DIRECTOR_BROWSER_SCAN_SECONDS="${DUNE_AUTOSCALER_DIRECTOR_BROWSER_SCAN_SECONDS:-30}"
@@ -3301,8 +3304,16 @@ director_logs_contain_live_ids() {
   [ "$missing" -eq 0 ]
 }
 
+director_capacity_failure_confirmed() {
+  # Browser declarations arrive about once a minute. A cached pre-repair zero
+  # or absent server ID is not evidence that the live repair failed.
+  director_logs --timestamps --since 10m 2>/dev/null \
+    | python3 runtime/scripts/director-browser-state.py \
+      --after "$1" --now "$2" --grace "$DIRECTOR_HEAL_REPUBLISH_GRACE_SECONDS"
+}
+
 core_maps_ready_for_browser_heal() {
-  local container partition state running started_at logs
+  local container partition state running started_at logs cached_start pattern
 
   while IFS='|' read -r container partition; do
     state="$(docker inspect -f '{{.State.Running}}|{{.State.StartedAt}}' "$container" 2>/dev/null || true)"
@@ -3310,13 +3321,41 @@ core_maps_ready_for_browser_heal() {
     [ "$running" = "true" ] || return 1
     [ -n "${started_at:-}" ] || return 1
 
+    # Readiness is a one-time startup message, so a busy map eventually pushes
+    # it out of the bounded tail. Retain proof for this process generation;
+    # a restart of the same container must establish its own readiness again.
+    cached_start="$(director_heal_get "core-ready:${container}" 2>/dev/null || true)"
+    if [ "$cached_start" = "$started_at" ]; then
+      continue
+    fi
+
     # Docker retains logs across restarts of the same named container. Looking
     # at the unbounded tail can therefore find a READY marker from the previous
     # process and let browser healing restart Director while the replacement
     # core server is still loading. Only accept readiness emitted by the
     # container's current process generation.
-    logs="$(timeout --kill-after=2s 12s docker logs --since "$started_at" --tail 5000 "$container" 2>&1 || true)"
-    grep -Eq "Server farm is READY .*partition ${partition}([,[:space:]]|$)" <<<"$logs" || return 1
+    logs="$(timeout --kill-after=2s 12s docker logs --timestamps --tail 5000 "$container" 2>&1 \
+      | python3 runtime/scripts/filter-container-logs.py "$started_at" || true)"
+    pattern="Server farm is READY .*partition ${partition}([,[:space:]]|$)"
+    if ! grep -Eq "$pattern" <<<"$logs"; then
+      # As with the shared readiness reader, a damaged large-tail index can
+      # hide the current log while a smaller bounded tail remains readable.
+      logs="$(timeout --kill-after=2s 12s docker logs --timestamps --tail 1000 "$container" 2>&1 \
+        | python3 runtime/scripts/filter-container-logs.py "$started_at" || true)"
+    fi
+    if ! grep -Eq "$pattern" <<<"$logs"; then
+      # One cold lookup may need older retained output from this same process.
+      # Stream it so a large log never becomes a shell variable, and grep's
+      # early exit cannot turn a matching line into a pipefail/SIGPIPE failure.
+      if ! grep -Eq "$pattern" < <(timeout --kill-after=2s 12s docker logs --timestamps "$container" 2>&1 \
+        | python3 runtime/scripts/filter-container-logs.py "$started_at" 2>/dev/null); then
+        # Docker can lose the startup line or return only an old rotated log.
+        # Reuse the canonical, timestamp-filtered native Director proof rather
+        # than treating a DB ready flag as evidence of completed startup.
+        farm_partition_has_stable_director_reports "$partition" "$farm_ready_director_fallback_reports" "$container" || return 1
+      fi
+    fi
+    director_heal_set "core-ready:${container}" "$started_at" || true
   done <<'EOF'
 dune-server-survival-1|1
 dune-server-overmap|2
@@ -3430,9 +3469,15 @@ scan_director_browser_state() {
     publish_state_for_map Survival_1
     publish_state_for_map Overmap
     publish_state_for_map DeepDesert_1
-    director_heal_set browser_republish_at "$now"
+    # Publications can take tens of seconds. Start the observation window
+    # after they finish, so their execution time cannot consume the grace.
+    director_heal_set browser_republish_at "$(date +%s)"
     return 0
   fi
+
+  # Require sustained, fresh zero-capacity declarations AFTER the repair.
+  # Unknown/missing evidence can request a safe republish, never a restart.
+  director_capacity_failure_confirmed "$republish_at" "$now" || return 0
 
   if last_restart="$(director_heal_get last_restart 2>/dev/null)"; then
     since_restart=$((now - last_restart))
@@ -3441,7 +3486,7 @@ scan_director_browser_state() {
     fi
   fi
 
-  # Restarting Director also replaces Survival_1. Never run that disruptive
+  # Rebuilding the game farm replaces every world map. Never run that disruptive
   # recovery while a player is active (or while occupancy cannot be proved).
   # Republishing above remains safe to perform while players are connected;
   # the restart will be retried automatically after the battlegroup is empty.
@@ -3458,11 +3503,22 @@ scan_director_browser_state() {
     return 0
   fi
 
-  echo "HEAL director stale browser state action=restart capacity=${capacity:-unknown} ready_maps=$ready_count republish_age=$republish_age"
-  runtime/scripts/restart-director.sh >/dev/null 2>&1 || {
-    echo "ERROR failed to restart director during stale browser state heal"
+  # The browser can lose capacity because a core map stopped reporting state.
+  # Replacing only Director/Hagga leaves Overmap and other peers in the old
+  # farm generation. Use the same coordinated recovery as the IGW watchdog.
+  if ! docker inspect -f '{{.State.Running}}' dune-coriolis-coordinator 2>/dev/null | grep -qx true; then
+    echo "ERROR stale browser state action=coordinated-game-farm-restart coordinator=unavailable"
     return 0
-  }
+  fi
+  echo "HEAL director stale browser state action=coordinated-game-farm-restart capacity=${capacity:-unknown} ready_maps=$ready_count republish_age=$republish_age"
+  if ! docker exec -d dune-coriolis-coordinator bash -lc \
+    'set -o pipefail; umask 077
+     mkdir -p runtime/logs
+     runtime/scripts/restart-game-farm.sh stale-browser-state 2>&1 |
+       sed -n -e "/^=== .* ===$/p" -e "/^Finished: /p" -e "/^Coordinated game-farm restart completed\.$/p" >> runtime/logs/browser-state-recovery.log'; then
+    echo "ERROR failed to request coordinated game-farm restart during stale browser state heal"
+    return 0
+  fi
   director_heal_set last_restart "$now"
   director_heal_clear stale_since
   director_heal_clear browser_republish_at
